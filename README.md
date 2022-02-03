@@ -43,6 +43,6 @@ model = Swin_timesformer(sec_len=10,
 model = model.cuda()
 x =  torch.rand(2, 10, 3, 112, 112).cuda()
 model(x)
-
+```
 
 

@@ -627,19 +627,16 @@ class SwinTransformerBlock_joint_space_time(SwinTransformerBlock):
 
 
 
-class SwinTransformerBlock_divided_space_time(SwinTransformerBlock_joint_space_time):
+class SwinTransformerBlock_divided_space_time(SwinTransformerBlock):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm, **kwargs):
         
         super().__init__(dim=dim, input_resolution=input_resolution, num_heads=num_heads, window_size=window_size, 
             shift_size=shift_size, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop, attn_drop=attn_drop, drop_path=drop_path,
-            act_layer=act_layer, norm_layer=norm_layer, **kwargs)
+            act_layer=act_layer, norm_layer=norm_layer)
         
-        self.attn = WindowAttention(
-            dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-
+        self.sec_len = kwargs["sec_len"]
         # Temporal Attention Parameters
         self.temporal_norm1 = norm_layer(dim)
         self.temporal_attn = Attention(
