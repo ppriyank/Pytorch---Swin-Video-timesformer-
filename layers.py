@@ -194,10 +194,6 @@ class WindowAttention(nn.Module):
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
-        if type(mask) != None:
-            import pdb
-            pdb.set_trace()
-
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
@@ -227,6 +223,54 @@ class WindowAttention(nn.Module):
 
     def extra_repr(self) -> str:
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
+
+
+
+
+class WindowAttention_temporal(WindowAttention):
+    def __init__(self, dim, sec_len , window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+
+        super().__init__(dim=dim, window_size=window_size, num_heads=num_heads, qkv_bias=qkv_bias,
+         qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=proj_drop)
+
+        self.sec_len = sec_len
+        
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        B_, N, C = x.shape
+
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        q = q * self.scale
+
+        attn = (q @ k.transpose(-2, -1))
+        
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        nW = mask.shape[0]
+
+        attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+        attn = attn.view(-1, self.num_heads, N, N)
+        attn = self.softmax(attn)
+    
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def extra_repr(self) -> str:
+        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
+
 
 
 
@@ -493,11 +537,41 @@ class SwinTransformerBlock_joint_space_time(SwinTransformerBlock):
                  mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop, attn_drop=attn_drop, drop_path=drop_path,
                  act_layer=act_layer, norm_layer=norm_layer)
         
+
         self.sec_len = kwargs["sec_len"]
         self.attn = WindowAttention(
             dim, window_size=(self.sec_len, self.window_size * self.window_size), num_heads=num_heads,
             qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
 
+        self.attn_temporal = WindowAttention_temporal(
+            dim, sec_len=self.sec_len, window_size=(self.sec_len, self.window_size * self.window_size), num_heads=num_heads,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+
+
+        if self.shift_size > 0:
+            # calculate attention mask for SW-MSA
+            H, W = self.input_resolution
+            img_mask = torch.zeros((self.sec_len, H, W, 1))  # 1 H W 1
+            h_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            w_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+            
+            mask_windows = window_partition_joint_space_time(img_mask.unsqueeze(0), self.window_size)  # nW, window_size, window_size, 1
+            mask_windows = mask_windows.view(-1, self.sec_len * self.window_size * self.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        else:
+            attn_mask = None
+
+        self.register_buffer("attn_mask", attn_mask)
 
     def forward(self, x):
         H, W = self.input_resolution
@@ -525,7 +599,12 @@ class SwinTransformerBlock_joint_space_time(SwinTransformerBlock):
         # x_windows (B * H_cells // window_size * W_cells // window_size, T * window_size * window_size, C
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+        if self.shift_size >0 :
+            attn_windows = self.attn_temporal(x_windows, mask=self.attn_mask)
+        else:    
+            attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C 
+        
+        
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.sec_len, self.window_size, self.window_size, C)
